@@ -1,25 +1,40 @@
 #!/bin/bash
-config_dir=ss/config.d
-pid_dir="ss/pid"
-log_dir="ss/log"
-index_config_file="ss/index.json"
+listen_ip="127.0.0.1"
 start_listen_port=50000
-sub_address=""
-data_array=()
 
+# 下面的变量不用更改
+readonly base_dir="$HOME/.ss-manager"
+readonly config_dir=${base_dir}/config.d
+readonly pid_dir="${base_dir}/pid"
+readonly log_dir="${base_dir}/log"
+readonly index_file="${base_dir}/index.json"
+data_array=()
+function get_sub_address(){
+    sub_address=${SS_MANAGER_SUB_ADDRESS}
+    test -z "$sub_address" && {
+        echo "请定义SS_MANAGER_SUB_ADDRESS变量，此变量表示订阅地址,格式前缀http"
+        exit 1
+    }
+}
 function get_config() {
-    test -z "$index_config_file" && {
-        echo "请定义index_config_file变量"
-        return
-    }
-    test -r "$index_config_file" || {
-        echo "配置文件不存在，检查文件${index_config_file}"
-        return
-    }
     echo "当前订阅地址为: ${sub_address}"
     local seq
     seq=0
-    content=$(cat "${index_config_file}")
+    content=$(cat "${index_file}")
+    length=$(echo "$content" | jq 'length')
+    for ((seq; seq < length; seq = seq + 1)); do
+        line=$(echo "$content" | jq ".[${seq}]")
+        local_listen=$(echo "$line" | jq -r ".local_listen")
+        name=$(echo "$line" | jq -r ".name")
+        file=$(echo "$line" | jq -r ".file")
+        echo "${seq} ${name}"
+    done
+}
+function get_verbose_config() {
+    echo "当前订阅地址为: ${sub_address}"
+    local seq
+    seq=0
+    content=$(cat "${index_file}")
     length=$(echo "$content" | jq 'length')
     for ((seq; seq < length; seq = seq + 1)); do
         line=$(echo "$content" | jq ".[${seq}]")
@@ -30,16 +45,8 @@ function get_config() {
     done
 }
 function create_config() {
-    test -z "$sub_address" && {
-        echo "订阅地址不存在,请定义sub_address变量"
-        return
-    }
-    test -e "${index_config_file}" && {
-        echo "配置文件已存在，路径:${index_config_file}"
-        return
-    }
     base64_list=$(curl -s "${sub_address}" | base64 -d)
-
+    seq=0
     while IFS= read -r line; do # Use IFS= to avoid trimming leading/trailing whitespace
         local index_json
         if [[ ! $line =~ ^ss:// ]]; then
@@ -56,7 +63,7 @@ function create_config() {
         server_port=$(echo "$line" | cut -d# -f1 | cut -d: -f2)
         name=$(python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1]))" "${line#*#}") # Unquote the name
 
-        get_local_port
+        start_listen_port=$(get_local_port)
         config_json="{\"server\":\"$server\",\"server_port\":$server_port,\"password\":\"$password\",\"method\":\"$method\",\"local_port\":$start_listen_port}"
 
         uuid=$(head -1 /dev/urandom | od -x | awk '{print $2$3"-"$4$5"-"$6$7"-"$8$9}' | head -n1)
@@ -67,32 +74,32 @@ function create_config() {
 
         # 将连接信息放到索引文件中，用于参考
         name=$(echo "${name}" | tr -d "\r")
-        local_listen="socks5h://127.0.0.1:${start_listen_port}"
+        local_listen="socks5h://${listen_ip}:${start_listen_port}"
         index_json=$(jq -n --arg a "${local_listen}" --arg b "$name" --arg c "${config_uuid_file}" '{name: $b, local_listen: $a, file: $c}')
         data_array+=("${index_json}")
-        echo "发现 名称:${name} 服务器IP地址:${server}:${server_port} 本地连接代理:${local_listen}"
+        seq=$((seq+1))
+        echo "${seq} ${name}"
 
     done <<<"$base64_list" # Use a here-string for better variable expansion
 
-    echo "${data_array[*]}" | jq -s . >"${index_config_file}"
+    echo "${data_array[*]}" | jq -s . >"${index_file}"
 
 }
 function rm_config() {
-    
+
     rm -rf "${config_dir}" && echo "已删除${config_dir}"
-    rm -f "${index_config_file}" && echo "已删除${index_config_file}"
+    rm -f "${index_file}" && echo "已删除${index_file}"
     mkdir -p "${config_dir}" >/dev/null 2>&1 || {
-        echo "创建${config_dir}失败"
+        echo "创建文件夹失败,路径:${config_dir}"
         exit 1
     }
 }
 function get_local_port() {
 
-    while sudo nmap -sT -p ${start_listen_port} 127.0.0.1 | grep "^${start_listen_port}/tcp\ open" >/dev/null 2>&1; do
+    while nmap -sT -p ${start_listen_port} 127.0.0.1 | grep "^${start_listen_port}/tcp\ open" >/dev/null 2>&1; do
         start_listen_port=$((start_listen_port + 1))
     done
-    start_listen_port=$((start_listen_port + 1))
-
+    echo $((start_listen_port + 1))
 }
 function check_ss() {
     local seq
@@ -109,14 +116,14 @@ function check_ss() {
 
         pid=$(cat "$pid_file")
         if ! ps -p "$pid" >/dev/null 2>&1; then
-            rm -f "$pid_file" 
+            rm -f "$pid_file"
             continue
         fi
 
         args=$(ps -p "$(cat "$pid_file")" -o args | tail -n1)
         file="$(echo "$args" | awk '{print $3}')"
 
-        json_content=$( jq '.[] | select(.file == "'"${file}"'")' < ${index_config_file})
+        json_content=$(jq '.[] | select(.file == "'"${file}"'")' <${index_file})
         local_listen=$(echo "$json_content" | jq -r ".local_listen")
         name=$(echo "$json_content" | jq -r ".name")
         echo "序号: $((seq + 1))"
@@ -129,10 +136,8 @@ function check_ss() {
     done <<<"${ret}"
 }
 function start_ss() {
-    which ss-local >/dev/null 2>&1 || {
-        echo "未找到ss-local命令，项目地址：https://github.com/shadowsocksr-backup/shadowsocksr-libev"
-    }
-    content=$(cat "${index_config_file}")
+
+    content=$(cat "${index_file}")
     length=$(echo "$content" | jq 'length')
 
     echo "输入序号（通过查看配置可确定）"
@@ -151,26 +156,27 @@ function start_ss() {
         echo "发现已存在对应的pid文件"
         pid=$(cat "$pid_file")
         if ps -p "$pid" >/dev/null 2>&1; then
-            sudo kill "${pid}" && rm -f "$pid_file" && echo "已停止 ${pid}"
+            kill "${pid}" && rm -f "$pid_file" && echo "已停止 ${pid}"
         else
             rm -f "$pid_file" && echo "删除无效的pid文件"
         fi
     }
     echo "启动"
     echo "名称: ${name} "
+    echo "本地代理地址: ${local_listen}"
     echo "配置文件: ${file}"
     echo "日志文件位置: ${log_file}"
     echo "PID文件位置: ${pid_file}"
+    echo "启动命令: ss-local -c "${file}" -f "${pid_file}" --fast-open"
 
-    nohup sudo ss-local -c "${file}" -f "${pid_file}" --fast-open >"$log_file" 2>&1 &
+    nohup ss-local -c "${file}" -f "${pid_file}" --fast-open >"$log_file" 2>&1 &
 
     # 通过pid文件来判断程序是否启动正常
     sleep 1
     if [ -n "$(cat "${pid_file}")" ]; then
         echo "PID: $(cat "${pid_file}")"
     else
-        echo ""
-        echo "启动失败"
+        echo -e "\n启动失败"
     fi
 }
 function stop_ss() {
@@ -183,7 +189,7 @@ function stop_ss() {
 
     pid=$(cat "$pid_file")
     if ps -p "$pid" >/dev/null 2>&1; then
-        sudo kill "${pid}" && rm -f "$pid_file" && echo "已停止 ${pid}"
+        kill "${pid}" && rm -f "$pid_file" && echo "已停止 ${pid}"
     else
         rm -f "$pid_file"
     fi
@@ -198,7 +204,7 @@ function stop_all_ss() {
     while IFS= read -r line; do
         pid=$(cat "$line")
         if ps -p "pid" >/dev/null 2>&1; then
-            sudo kill "${pid}" && rm -f "$line" && echo "已停止 ${pid}"
+            kill "${pid}" && rm -f "$line" && echo "已停止 ${pid}"
         else
             rm -f "$line"
         fi
@@ -206,7 +212,24 @@ function stop_all_ss() {
     echo "已停止所有"
 
 }
+function check_commmand() {
+    which ss-local >/dev/null 2>&1 || {
+        echo "未找到ss-local命令，项目地址：https://github.com/shadowsocksr-backup/shadowsocksr-libev"
+    }
+    which nmap >/dev/null 2>&1 || {
+        echo "未找到nmap命令"
+    }
+    which jq >/dev/null 2>&1 || {
+        echo "未找到jq命令"
+    }
+    which curl >/dev/null 2>&1 || {
+        echo "未找到curl命令"
+    }
+}
 function check_dir() {
+    test ! -e ${config_dir} && {
+        mkdir -p ${config_dir}
+    }
     test ! -e ${pid_dir} && {
         mkdir -p ${pid_dir}
     }
@@ -214,44 +237,52 @@ function check_dir() {
         mkdir -p ${log_dir}
     }
 }
+
 function main() {
+    check_commmand
     check_dir
     while true; do
 
         echo ""
         echo "-----------------------"
-        echo "1 订阅 - 查看配置"
-        echo "2 订阅 - 获取并生成"
-        echo "3 订阅 - 删除配置（将停止所有服务）"
-        echo "4 服务监听 - 查看"
-        echo "5 服务监听 - 启动"
-        echo "6 服务监听 - 停止"
-        echo "7 服务监听 - 停止所有"
+        echo -e "1\t订阅\t获取配置"
+        echo -e "2\t订阅\t查看配置"
+        echo -e "3\t订阅\t查看详细配置"
+        echo -e "4\t订阅\t删除配置且停止所有服务"
+        echo -e "5\t服务监听\t查看"
+        echo -e "6\t服务监听\t启动"
+        echo -e "7\t服务监听\t停止"
+        echo -e "8\t服务监听\t停止所有"
+        echo -e "其他键\t退出"
 
         echo ""
         read -r seq
         echo ""
         case "${seq}" in
         1)
-            get_config
-            ;;
-        2)
+            get_sub_address
             create_config
             ;;
+                2)
+            get_config
+            ;;
         3)
+            get_verbose_config
+            ;;
+        4)
             stop_all_ss
             rm_config
             ;;
-        4)
+        5)
             check_ss
             ;;
-        5)
+        6)
             start_ss
             ;;
-        6)
+        7)
             stop_ss
             ;;
-        7)
+        8)
             stop_all_ss
             ;;
         *)
